@@ -1,0 +1,35 @@
+# Default training config for MA-DBP on VMAS navigation_v2.
+# All paths are relative to the repo root.
+
+h5_path: "data/navigation_v2_Na_4_T_40_dataset.h5"
+out_dir: "checkpoints"
+run_name: "madbp_navigation_v2_n4"
+
+max_agents: 10
+horizon: 8                 # moving-window size (paper's H)
+diffusion_steps: 150
+schedule: "linear"         # {"linear", "cosine"}
+cfg_dropout_prob: 0.0      # > 0 enables classifier-free guidance training
+
+epochs: 2000
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 1.0e-4
+grad_clip: 1.0
+num_workers: 4
+log_every: 50
+save_every: 200
+
+device: "cuda"
+use_curriculum: true        # P0: curriculum is actually injected into the loader
+
+# Loss weights. The denoising term carries most of the signal; auxiliary
+# terms shape trajectory smoothness, boundary adherence, and collision
+# avoidance. Set any to zero to disable.
+loss_weights:
+  denoising: 0.90
+  boundary:  0.04
+  temporal:  0.06
+  velocity:  0.00
+  collision: 0.00
+  goal:      0.00

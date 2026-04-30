@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Project artifacts
+runs/
+checkpoints/
+samples/
+samples_moving_horizon/
+data/*.h5
+data/*.hdf5
+results/
+*.pth
+*.ckpt
+wandb/
+outputs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
