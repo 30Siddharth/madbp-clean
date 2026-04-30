@@ -152,6 +152,10 @@ tests/                  # CPU smoke tests (run on every push)
 .github/workflows/      # CI
 ```
 
+## Roadmap: Distributed CBF backbone (follow-up paper)
+
+A distributed control-barrier-function safety backbone for the diffusion sampler is sketched in [`docs/cbf_backbone.md`](docs/cbf_backbone.md). The interface is stubbed in `src/madbp/sampling/cbf.py` (currently `NotImplementedError`). Trainer, model, and dataset stay unchanged — the CBF is a deployment-time add-on. See the design doc for the math, the predicted-neighbor surrogate, and the experiment plan.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
