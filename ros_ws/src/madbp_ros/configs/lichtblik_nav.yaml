@@ -1,0 +1,28 @@
+# MA-DBP + Lichtblik navigation scenario
+# Load with: ros2 launch madbp_ros lichtblik_sim.launch.py
+
+# --- Planner node ---
+madbp_planner:
+  ros__parameters:
+    checkpoint: ""                    # set to your .pth path
+    max_agents: 10
+    horizon: 8
+    diffusion_steps: 150
+    cfg_scale: 1.0
+    max_step_size: 0.05
+    device: "cpu"                     # change to "cuda" on GPU machines
+    image_topic: "/env/image"
+    plan_topic_base: "/madbp/agent"
+    full_horizon_length: 64
+
+# --- Lichtblik bridge ---
+lichtblik_bridge:
+  ros__parameters:
+    n_agents: 4                       # must match the value the model was deployed with
+    world_size: 10.0
+    render_size: 64
+    sim_hz: 20.0
+    collision_radius: 0.3
+    kp: 3.0
+    kv: 0.5
+    max_vel: 1.0
