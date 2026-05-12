@@ -1,0 +1,28 @@
+# MA-DBP + MuJoCo-ROS2-Control navigation scenario
+# Load with: ros2 launch madbp_ros mujoco_sim.launch.py
+
+# --- Planner node (identical to lichtblik_nav.yaml) ---
+madbp_planner:
+  ros__parameters:
+    checkpoint: ""
+    max_agents: 10
+    horizon: 8
+    diffusion_steps: 150
+    cfg_scale: 1.0
+    max_step_size: 0.05
+    device: "cpu"
+    image_topic: "/env/image"
+    plan_topic_base: "/madbp/agent"
+    full_horizon_length: 64
+
+# --- MuJoCo bridge ---
+mujoco_bridge:
+  ros__parameters:
+    n_agents: 4
+    sim_hz: 100.0
+    render_width: 64
+    render_height: 64
+    kp: 30.0
+    kv: 2.5
+    max_force: 1.0
+    mujoco_xml: ""                    # empty = use built-in default XML
