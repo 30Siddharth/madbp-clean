@@ -29,6 +29,7 @@ from madbp.data import NormalizedTrajectoryDataset
 from madbp.data.dataset import make_collate
 from madbp.models.diffusion import LossWeights, MultiAgentDiffusionPlanner
 from madbp.training.curriculum import sigmoid_curriculum
+from madbp.utils import get_device
 
 
 @dataclass
@@ -49,7 +50,9 @@ class TrainConfig:
     num_workers: int = 4
     log_every: int = 50
     save_every: int = 200
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # "cuda" is the canonical default; get_device() in Trainer.__init__ handles
+    # the MPS / CPU fallback automatically so the config file stays portable.
+    device: str = "cuda"
     use_curriculum: bool = True
     loss_weights: LossWeights = LossWeights()
 
@@ -67,7 +70,7 @@ class Trainer:
 
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
-        self.device = torch.device(cfg.device)
+        self.device = get_device(cfg.device)   # MPS fallback on Apple Silicon
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(os.path.join("runs", cfg.run_name))
 
@@ -158,7 +161,7 @@ class Trainer:
                 batch_size=cfg.batch_size,
                 shuffle=True,
                 num_workers=cfg.num_workers,
-                pin_memory=(self.device.type == "cuda"),
+                pin_memory=(self.device.type == "cuda"),  # pin_memory unsupported on MPS
                 collate_fn=make_collate(cfg.max_agents, n_active),
             )
 
