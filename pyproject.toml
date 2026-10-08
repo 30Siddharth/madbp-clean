@@ -31,6 +31,9 @@ dependencies = [
 sim = [
     "vmas>=1.4.4",
 ]
+mujoco = [
+    "mujoco>=3.1",
+]
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",

@@ -9,10 +9,15 @@ inter-agent **axial-attention** preprocessor and rolled out in a
 **moving window** — generalises zero-shot from small training teams to
 larger deployment teams in continuous multi-robot navigation.
 
-> Status: structural rewrite of `30Siddharth/madbp` `v2_2`. Behavioural
-> deltas are documented in [`docs/changes.md`](docs/changes.md).
-> Math contract: [`docs/math.md`](docs/math.md). Pipeline diagram:
-> [`docs/pipeline.md`](docs/pipeline.md).
+> **Branch `paper-aligned`.** Defaults follow the paper (loss weights, pre-processor in
+> the training path, Algorithm 2 sampling); original-code extras are off-by-default flags.
+> Paper-vs-code table and open items: [`docs/paper_alignment.md`](docs/paper_alignment.md).
+> Math: [`docs/math.md`](docs/math.md). Pipeline: [`docs/pipeline.md`](docs/pipeline.md).
+
+> **Verification status.** The torch model/trainer, the MuJoCo arena and the VMAS layout
+> provider were written without being run (no torch/MuJoCo/VMAS in the authoring
+> environment). The torch-free simulation core (`madbp.sim`) is tested. Run `pytest` first;
+> old `v2_2` diffusion checkpoints are **not** loadable and must be retrained.
 
 ---
 
@@ -40,25 +45,9 @@ flowchart LR
     XHAT --> LOSS[L_total]
 ```
 
-`L_total` decomposes into a Min-SNR-weighted denoising MSE plus boundary,
-temporal-consistency, velocity, collision, and goal terms. Coefficients are
-all in [`configs/madbp_navigation_v2.yaml`](configs/madbp_navigation_v2.yaml)
-and the math is in [`docs/math.md`](docs/math.md).
-
-## What's new vs. the arXiv v1 reference
-
-This is a *structural* rewrite, not a redesign. Five P0 fixes change
-results:
-
-1. The axial preprocessor is now actually used during training (the v2_2
-   code silently bypassed it via a linear projection).
-2. The duplicated `compute_collision_loss` is deduplicated.
-3. The total-loss formula is one explicit line, not three dead `if/elif`
-   branches followed by a different total.
-4. The agent-count curriculum is finally injected into the dataloader.
-5. All auxiliary losses are vectorised; per-batch Python loops are gone.
-
-Full audit: [`docs/changes.md`](docs/changes.md).
+`L_total = 0.85·L_noise + 0.025·L_boundary + 0.025·L_temporal + 0.10·L_collision`
+(paper Eq. 8; velocity/goal terms and Min-SNR weighting exist but are off by default).
+Coefficients live in [`configs/madbp_navigation_v2.yaml`](configs/madbp_navigation_v2.yaml).
 
 ---
 
@@ -69,53 +58,95 @@ Requires Python ≥ 3.11.
 ```bash
 git clone https://github.com/30Siddharth/madbp-clean.git
 cd madbp-clean
+git checkout paper-aligned
 
-# CPU-only quick start (good for tests + design work):
-pip install -e ".[dev]"
-# OR with VMAS for end-to-end eval (Linux + GPU recommended):
-pip install -e ".[dev,sim]"
+pip install -e ".[dev]"            # model, training, tests (CPU is fine for tests)
+pip install -e ".[dev,mujoco]"     # + MuJoCo physics arena
+pip install -e ".[dev,mujoco,sim]" # + VMAS (layouts/frames identical to the training renders)
 ```
 
-The CI installs the CPU-only torch wheel, runs `ruff`, and runs the smoke
-tests — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+The simulation core (`madbp.sim`, straight-line baseline) needs only `numpy`.
 
-## Quick start
+## Workflow
 
-### Smoke-test the pipeline (CPU, < 10 s)
+Each step needs the previous one.
 
+### 1. Test
 ```bash
-pytest -q
+pytest            # tests/test_sim.py (no torch needed) + tests/test_smoke.py (torch)
 ```
 
-### Train on a VMAS dataset
+### 2. Prepare data
+Training reads an HDF5 file with one entry per episode under these groups
+(shapes `[...]`; only XY is used):
 
+| group | shape | note |
+|---|---|---|
+| `frames/<ep>` | `[F, H, W, 3]` | frame 0 is the scenario image; uint8 or float |
+| `trajectories/<ep>` | `[T, Na, ≥2]` | expert (MAPPO) trajectories |
+| `start_poses/<ep>`, `goal_poses/<ep>` | `[Na, ≥2]` | |
+| `obstacles/<ep>` *(optional)* | `[M, 2]` | world-frame obstacle centres; enables the obstacle term of Eq. 7 |
+
+Put it at the `h5_path` in the config (default `data/navigation_v2_Na_4_T_40_dataset.h5`).
+Frames are rescaled to `[0, 1]` automatically; use the same image size/colour convention at
+deployment as in the dataset.
+
+### 3. Train
 ```bash
-# Generate or download data/<scenario>_Na_<n>_T_<T>_dataset.h5 first.
 madbp-train --config configs/madbp_navigation_v2.yaml
 ```
+Key config fields: `n_train_max` (largest team in training), `max_agents` (capacity at
+deployment), `curriculum` (`linear_stage` | `sigmoid` | `none`), `stage_epochs`,
+`loss_weights`, `d_min_world`/`d_obs_world`. Checkpoints (`checkpoints/*.pth`) store the model
+config, normalisation statistics and mean window displacement, so evaluation needs only the path.
+TensorBoard logs go to `runs/`.
 
-Checkpoints land in `checkpoints/`, TensorBoard logs in `runs/`.
-
-### Evaluate
-
+### 4. Closed-loop simulation (feasibility results)
 ```bash
-madbp-eval --method madp \
-           --scenario navigation_v2 \
-           --n-agents 4 \
-           --seed 0 \
-           --n-episodes 50 \
-           --checkpoint checkpoints/madbp_navigation_v2_n4_epoch_01999.pth \
-           --out results/madp_navigation_v2_n4.csv
+# Baseline (torch-free): straight-line sub-goals + PD tracker
+python scripts/run_sim.py --planner straight --arena kinematic \
+    --kinds open obstacles barrier corridor --n-agents 2 4 --seeds 20 --out results/straight.csv
+
+# MA-DBP, MuJoCo physics, train-4 / deploy-4..10, with agents added and removed mid-episode
+python scripts/run_sim.py --planner madbp --checkpoint checkpoints/madbp_paper_epoch_01999.pth \
+    --arena mujoco --kinds open obstacles barrier --n-agents 4 6 8 10 --seeds 50 \
+    --dynamic --out results/madbp_mujoco.csv
 ```
+Useful flags: `--steps` (DDIM steps), `--init gaussian|linear` (`linear` is a warm start that is
+*not* in the paper; report separately), `--no-pinning-cap` (ablation: use the final goal as
+sub-goal), `--device cuda`. Scenario kinds: `open`, `obstacles`, `barrier`, `corridor`.
+One CSV row per episode: success, goals reached, agent–agent and agent–obstacle collisions,
+makespan, path length, jerk, tracking error, planning time, minimum pair distance.
 
-One CSV row per episode, with metrics:
-`success, final_goal_distance, n_collisions, collision_rate,
-path_length_mean, makespan, mean_acceleration, mean_jerk, plan_runtime_s,
-time_to_goal_mean, spl`. Aggregate across seeds/methods downstream.
+How an episode runs: every `H-1` waypoints (and immediately after a team change) the executor
+sets each agent's sub-goal (straight line to its goal, capped at the training window
+displacement), samples a window with MA-DBP, and tracks the waypoints with a PD controller in
+the arena. `Event(step, "add"|"remove", ...)` adds or drops agents by flipping the active mask.
 
-Baseline runners (`mappo`, `clf_qp`, `mmd`, `projected_diffusion`) currently
-raise `NotImplementedError` — they will be ported as Experiment 1
-progresses; see [`docs/changes.md`](docs/changes.md).
+To use VMAS-rendered scenario images instead of the built-in approximate rasteriser, see
+`madbp/sim/vmas_layout.py`.
+
+### 5. Legacy evaluator
+```bash
+madbp-eval --method madp --scenario barrier --n-agents 4 --n-episodes 50 \
+           --checkpoint checkpoints/madbp_paper_epoch_01999.pth --out results/madp.csv
+```
+Same simulator, `EpisodeMetrics` CSV. Baselines `mappo`, `clf_qp`, `mmd`,
+`projected_diffusion` are still stubs that raise `NotImplementedError`.
+
+### Python API
+```python
+from madbp.sim.planners import MADBPPlanner
+from madbp.sim.scenario import make_scenario
+from madbp.sim.arena import PointMassArena
+from madbp.sim.executor import run_episode, ExecConfig
+import numpy as np
+
+planner = MADBPPlanner("checkpoints/madbp_paper_epoch_01999.pth", device="cuda")
+sc = make_scenario("barrier", 6, np.random.default_rng(0))
+cfg = ExecConfig(replan_every=planner.horizon - 1, subgoal_cap=planner.window_disp_world or None)
+print(run_episode(PointMassArena(sc, max_agents=planner.max_agents), planner, cfg).as_row())
+```
 
 ---
 
@@ -124,18 +155,26 @@ progresses; see [`docs/changes.md`](docs/changes.md).
 ```
 src/madbp/
   models/
+    masks.py            # active-agent masks
     scheduler.py        # BoundaryAwareNoiseScheduler + SinusoidalPosEmb
     context.py          # ContextEncoder (env image + poses + count + attn)
     preprocessor.py     # AxialPreprocessor (inter-agent + temporal attn)
     unet.py             # TrajectoryUNet (per-agent 1-D U-Net w/ FiLM)
-    losses.py           # All 5 auxiliary losses, vectorised
+    losses.py           # boundary / temporal / collision (+ optional velocity, goal)
     diffusion.py        # MultiAgentDiffusionPlanner (single class, optional CFG)
   data/
-    dataset.py          # HDF5 dataset + curriculum-aware collate_fn
+    dataset.py          # HDF5 dataset, Batch(active mask), slot-shuffling collate
+    frames.py           # shared image scaling (train == deploy)
   training/
-    curriculum.py       # sigmoid + constant schedules
+    curriculum.py       # linear_stage / sigmoid / none
     trainer.py          # moving-window training loop + CLI
-  sampling/             # reserved for future guidance modules
+  sim/
+    scenario.py         # layouts (open/obstacles/barrier/corridor) + add/remove Events
+    arena.py            # numpy point-mass arena (test double)
+    mujoco_arena.py     # MuJoCo physics, same interface
+    executor.py         # receding-horizon closed loop + metrics
+    planners.py         # MADBPPlanner (checkpoint) + straight-line baseline
+    vmas_layout.py      # layouts/frames from VMAS
   evaluation/
     metrics.py          # EpisodeMetrics + helpers
     eval.py             # canonical CLI
@@ -144,10 +183,12 @@ src/madbp/
     seed.py             # seed_everything
 
 configs/                # YAML configs — one per experiment
+scripts/run_sim.py      # closed-loop experiment driver
 docs/
   pipeline.md           # data flow + ASCII diagram
   math.md               # full math contract
   changes.md            # P0 fixes + porting notes
+  paper_alignment.md    # paper-vs-code table, text fixes for the paper
 tests/                  # CPU smoke tests (run on every push)
 .github/workflows/      # CI
 ```
