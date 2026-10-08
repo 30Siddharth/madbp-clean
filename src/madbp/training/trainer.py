@@ -58,7 +58,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     num_workers: int = 4
     save_every: int = 200
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "auto"  # "auto" -> cuda, else mps (Apple silicon), else cpu
     # curriculum: "linear_stage" | "sigmoid" | "none"
     curriculum: str = "linear_stage"
     use_curriculum: bool = True  # kept for backwards compatibility; False == "none"
@@ -85,12 +85,22 @@ class TrainConfig:
         return cls(**cfg)
 
 
+def resolve_device(name: str) -> str:
+    if name != "auto":
+        return name
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class Trainer:
     """Moving-window trainer with explicit curriculum injection."""
 
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
-        self.device = torch.device(cfg.device)
+        self.device = torch.device(resolve_device(cfg.device))
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
         try:
             from torch.utils.tensorboard import SummaryWriter

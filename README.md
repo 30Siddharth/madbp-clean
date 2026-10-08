@@ -71,6 +71,26 @@ The simulation core (`madbp.sim`, straight-line baseline) needs only `numpy`.
 
 Each step needs the previous one.
 
+### 0. macOS (Apple silicon or Intel)
+Works. Use Python 3.11+ (e.g. `brew install python@3.12`, then `python3.12 -m venv .venv && source .venv/bin/activate`).
+`pip install -e ".[dev,mujoco]"` installs arm64 wheels for torch and MuJoCo. `device: "auto"` picks
+`mps` on Apple silicon (falls back to `cpu`); if you see an MPS "operator not implemented" error run
+with `PYTORCH_ENABLE_MPS_FALLBACK=1`. Use a small config for local runs (e.g. `epochs: 20`,
+`batch_size: 8`) and do the full 2000-epoch run on a CUDA workstation. VMAS rendering on macOS can be
+fiddly; the built-in rasteriser and MuJoCo arena need no display.
+
+**Fast end-to-end check with no real data** (a few minutes on a laptop):
+```bash
+python scripts/make_toy_dataset.py --out data/toy.h5 --episodes 64
+sed -e 's#data/navigation_v2_Na_4_T_40_dataset.h5#data/toy.h5#' -e 's/epochs: 2000/epochs: 4/' \
+    -e 's/save_every: 200/save_every: 2/' -e 's/num_workers: 4 .*/num_workers: 0/' -e 's/batch_size: 16/batch_size: 8/' \
+    configs/madbp_navigation_v2.yaml > configs/toy.yaml
+madbp-train --config configs/toy.yaml
+python scripts/run_sim.py --planner madbp --checkpoint checkpoints/madbp_paper_epoch_00003.pth \
+    --arena kinematic --kinds open --n-agents 4 --seeds 3 --out results/toy.csv
+```
+This only proves the pipeline runs; a 4-epoch model on random frames plans garbage.
+
 ### 1. Test
 ```bash
 pytest            # tests/test_sim.py (no torch needed) + tests/test_smoke.py (torch)

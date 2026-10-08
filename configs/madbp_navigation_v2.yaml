@@ -16,9 +16,9 @@ batch_size: 16
 lr: 3.0e-4
 weight_decay: 1.0e-4
 grad_clip: 1.0
-num_workers: 4
+num_workers: 4          # set 0 if DataLoader workers give trouble
 save_every: 200
-device: "cuda"
+device: "auto"          # cuda -> mps (Mac) -> cpu
 
 curriculum: "linear_stage"   # +1 agent every stage_epochs (default epochs // n_train_max)
 stage_epochs: null

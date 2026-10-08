@@ -58,7 +58,7 @@ class NormalizedTrajectoryDataset(Dataset):
         stats_episodes: int = 100,
     ) -> None:
         self.h5_path = h5_path
-        self.h5 = h5py.File(h5_path, "r")
+        self._h5 = None  # opened lazily so the dataset can be pickled to DataLoader workers (macOS spawn)
         eps = sorted(self.h5["frames"].keys())
         cut = int(len(eps) * train_ratio)
         self.episodes = eps[:cut] if split == "train" else eps[cut:]
@@ -67,6 +67,17 @@ class NormalizedTrajectoryDataset(Dataset):
         self.max_agents = max_agents
         self.has_obstacles = "obstacles" in self.h5
         self._compute_xy_stats(stats_episodes)
+
+    @property
+    def h5(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_path, "r")
+        return self._h5
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        d["_h5"] = None
+        return d
 
     # -- normalisation -------------------------------------------------
     def _compute_xy_stats(self, stats_episodes: int) -> None:
@@ -166,19 +177,17 @@ def collate_fn(
     return Batch(frames, starts, goals, n_agents, trajs, active, obstacles, obstacle_mask)
 
 
-def make_collate(
-    max_agents: int,
-    active_agents: int | None,
-    shuffle_slots: bool = False,
-) -> Callable:
-    """Return a picklable closure of :func:`collate_fn` for ``DataLoader``."""
+class CollateFn:
+    """Picklable collate callable (a closure would break DataLoader workers under macOS/Windows spawn)."""
 
-    def _f(batch):
-        return collate_fn(
-            batch,
-            max_agents=max_agents,
-            active_agents=active_agents,
-            shuffle_slots=shuffle_slots,
-        )
+    def __init__(self, max_agents: int, active_agents: int | None, shuffle_slots: bool = False) -> None:
+        self.max_agents = max_agents
+        self.active_agents = active_agents
+        self.shuffle_slots = shuffle_slots
 
-    return _f
+    def __call__(self, batch):
+        return collate_fn(batch, self.max_agents, self.active_agents, self.shuffle_slots)
+
+
+def make_collate(max_agents: int, active_agents: int | None, shuffle_slots: bool = False) -> Callable:
+    return CollateFn(max_agents, active_agents, shuffle_slots)
