@@ -1,34 +1,43 @@
-"""Moving-window training loop for MA-DBP.
+"""Moving-window training loop for MA-DBP (paper Sec. III-D).
 
-Pipeline (matches the paper):
+    for epoch in range(epochs):
+        n_active = curriculum(epoch)                  # agent count actually injected
+        loader   = build_loader(active_agents=n_active, shuffle_slots=True)
+        for batch in loader:
+            for window in moving_windows(batch.trajs):  # length-H windows
+                loss = model(frames, cur_pos, sub_goal, ..., window, weights)
+                loss.total.backward(); opt.step()
+                cur_pos = expert position at the end of the window
 
-  for epoch in range(epochs):
-      n_active = curriculum(epoch)                     # P0: actually injected
-      loader   = build_loader(active_agents=n_active)
-      for batch in loader:
-          for window in moving_windows(batch.traj):    # length-H windows
-              loss = model(frames, cur_pos, sub_goal, n_agents, window, weights)
-              loss.total.backward(); opt.step()
-              cur_pos = window[:, :, -1, :]            # shift window
+Sub-goals: the paper does not define the sub-goal of a non-final window.
+``subgoal_mode="expert"`` (default) uses the expert (MAPPO) position at the end
+of the window, i.e. a goal the demonstrator really reached; the last window uses
+the true goal. ``"linear"`` reproduces the original straight-line interpolation.
+At execution time the closed-loop executor uses a straight-line sub-goal whose
+distance is capped by the mean window displacement stored in the checkpoint.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
 import yaml
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from madbp.data import NormalizedTrajectoryDataset
-from madbp.data.dataset import make_collate
+from madbp.data.dataset import NormalizedTrajectoryDataset, make_collate
 from madbp.models.diffusion import LossWeights, MultiAgentDiffusionPlanner
-from madbp.training.curriculum import sigmoid_curriculum
+from madbp.training.curriculum import (
+    constant_curriculum,
+    linear_stage_curriculum,
+    sigmoid_curriculum,
+)
+
+LOSS_KEYS = ("total", "denoising", "boundary", "temporal", "velocity", "collision", "goal")
 
 
 @dataclass
@@ -41,17 +50,26 @@ class TrainConfig:
     diffusion_steps: int = 150
     schedule: str = "linear"
     cfg_dropout_prob: float = 0.0
+    min_snr_gamma: float | None = None  # off by default (not in the paper)
     epochs: int = 2000
     batch_size: int = 16
     lr: float = 3e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     num_workers: int = 4
-    log_every: int = 50
     save_every: int = 200
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    use_curriculum: bool = True
-    loss_weights: LossWeights = LossWeights()
+    # curriculum: "linear_stage" | "sigmoid" | "none"
+    curriculum: str = "linear_stage"
+    use_curriculum: bool = True  # kept for backwards compatibility; False == "none"
+    n_train_max: int = 4
+    stage_epochs: int | None = None
+    shuffle_slots: bool = True
+    # safety distances in WORLD units (converted to normalised units at runtime)
+    d_min_world: float = 0.1
+    d_obs_world: float = 0.1
+    subgoal_mode: str = "expert"  # "expert" | "linear"
+    loss_weights: LossWeights = field(default_factory=LossWeights)
 
     @classmethod
     def from_yaml(cls, path: str) -> TrainConfig:
@@ -59,6 +77,11 @@ class TrainConfig:
             cfg = yaml.safe_load(f) or {}
         lw = cfg.pop("loss_weights", {}) or {}
         cfg["loss_weights"] = LossWeights(**lw)
+        known = set(cls.__dataclass_fields__)
+        unknown = set(cfg) - known
+        if unknown:
+            print(f"[TrainConfig] ignoring unknown keys: {sorted(unknown)}")
+            cfg = {k: v for k, v in cfg.items() if k in known}
         return cls(**cfg)
 
 
@@ -69,16 +92,15 @@ class Trainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(os.path.join("runs", cfg.run_name))
+        try:
+            from torch.utils.tensorboard import SummaryWriter
 
-        # Dataset is built once; the loader is rebuilt each epoch with the
-        # curriculum-controlled collate function (P0 fix).
-        self.train_ds = NormalizedTrajectoryDataset(
-            cfg.h5_path, split="train", max_agents=cfg.max_agents
-        )
-        self.test_ds = NormalizedTrajectoryDataset(
-            cfg.h5_path, split="test", max_agents=cfg.max_agents
-        )
+            self.writer = SummaryWriter(os.path.join("runs", cfg.run_name))
+        except Exception:  # tensorboard optional
+            self.writer = None
+
+        self.train_ds = NormalizedTrajectoryDataset(cfg.h5_path, split="train", max_agents=cfg.max_agents)
+        self.test_ds = NormalizedTrajectoryDataset(cfg.h5_path, split="test", max_agents=cfg.max_agents)
 
         self.model = MultiAgentDiffusionPlanner(
             max_agents=cfg.max_agents,
@@ -89,114 +111,143 @@ class Trainer:
             diffusion_steps=cfg.diffusion_steps,
             schedule_type=cfg.schedule,
             cfg_dropout_prob=cfg.cfg_dropout_prob,
+            min_snr_gamma=cfg.min_snr_gamma,
+            d_min=self.train_ds.norm_distance(cfg.d_min_world),
+            d_obs=self.train_ds.norm_distance(cfg.d_obs_world),
         ).to(self.device)
 
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-        )
-        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=cfg.epochs, eta_min=1e-6
-        )
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=cfg.epochs, eta_min=1e-6)
         self.global_step = 0
+        # running mean of per-window displacement (normalised units), for the executor
+        self._disp_sum = 0.0
+        self._disp_n = 0
 
     # --------------------------------------------------------------
-    # One moving-window pass over a batch
-    # --------------------------------------------------------------
-    def _train_batch(
-        self,
-        frames: torch.Tensor,
-        starts: torch.Tensor,
-        goals: torch.Tensor,
-        n_agents: torch.Tensor,
-        full_trajs: torch.Tensor,
-    ) -> dict[str, float]:
+    def n_active(self, epoch: int) -> int:
+        c = self.cfg
+        mode = c.curriculum if c.use_curriculum else "none"
+        if mode == "linear_stage":
+            return linear_stage_curriculum(epoch, c.epochs, c.n_train_max, c.stage_epochs)
+        if mode == "sigmoid":
+            return sigmoid_curriculum(epoch, c.epochs, c.n_train_max)
+        return constant_curriculum(epoch, c.epochs, c.n_train_max)
+
+    def _train_batch(self, b) -> dict[str, float]:
         H = self.cfg.horizon
-        B, _, T_full, _ = full_trajs.shape
+        trajs = b.trajs
+        _, _, T_full, _ = trajs.shape
         n_windows = max(T_full // H, 1)
-        cur_pos = starts.clone()
-        agg = {"total": 0.0, "denoising": 0.0, "boundary": 0.0,
-               "temporal": 0.0, "velocity": 0.0, "collision": 0.0, "goal": 0.0}
+        cur_pos = b.starts.clone()
+        agg = {k: 0.0 for k in LOSS_KEYS}
+        act = b.active
 
         for k in range(n_windows):
             t0, t1 = k * H, k * H + H
-            window = full_trajs[:, :, t0:t1, :].clone()
+            window = trajs[:, :, t0:t1, :].clone()
             window[:, :, 0, :] = cur_pos
-            if k == n_windows - 1:
-                sub_goal = goals
-            else:
+            last = k == n_windows - 1
+            if last:
+                sub_goal = b.goals
+            elif self.cfg.subgoal_mode == "linear":
                 p = (k + 1) / n_windows
-                sub_goal = cur_pos + p * (goals - cur_pos)
+                sub_goal = cur_pos + p * (b.goals - cur_pos)
+            else:
+                sub_goal = trajs[:, :, t1 - 1, :]
+            # the window's own end point is pinned by the boundary loss: keep it
+            # consistent with the sub-goal given to the model.
+            window[:, :, -1, :] = sub_goal if last or self.cfg.subgoal_mode == "expert" else window[:, :, -1, :]
 
             self.opt.zero_grad(set_to_none=True)
             out = self.model(
-                frames, cur_pos, sub_goal, n_agents, window,
+                b.frames,
+                cur_pos,
+                sub_goal,
+                None,
+                window,
                 loss_weights=self.cfg.loss_weights,
+                active=act,
+                obstacles=b.obstacles if b.obstacles.shape[1] > 0 else None,
+                obstacle_mask=b.obstacle_mask if b.obstacles.shape[1] > 0 else None,
             )
             out.total.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
             self.opt.step()
 
-            for k_ in agg:
-                agg[k_] += float(getattr(out, k_).item() if torch.is_tensor(getattr(out, k_)) else getattr(out, k_))
-            cur_pos = full_trajs[:, :, t1 - 1, :].detach().clone()
+            for key in LOSS_KEYS:
+                v = getattr(out, key)
+                agg[key] += float(v.item() if torch.is_tensor(v) else v)
+            with torch.no_grad():
+                d = (window[:, :, -1] - window[:, :, 0]).norm(dim=-1)[act]
+                if d.numel():
+                    self._disp_sum += float(d.mean())
+                    self._disp_n += 1
+            cur_pos = trajs[:, :, t1 - 1, :].detach().clone()
 
         return {k: v / n_windows for k, v in agg.items()}
 
-    # --------------------------------------------------------------
-    # Main training loop
-    # --------------------------------------------------------------
+    def window_displacement(self) -> float:
+        return self._disp_sum / max(self._disp_n, 1)
+
+    def save(self, epoch: int) -> Path:
+        cfg = self.cfg
+        ckpt = Path(cfg.out_dir) / f"{cfg.run_name}_epoch_{epoch:05d}.pth"
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "model_config": self.model.model_config(),
+                "epoch": epoch,
+                "cfg": {k: (asdict(v) if k == "loss_weights" else v) for k, v in cfg.__dict__.items()},
+                "xy_mean": self.train_ds.xy_mean,
+                "xy_std": self.train_ds.xy_std,
+                "window_displacement": self.window_displacement(),
+            },
+            ckpt,
+        )
+        return ckpt
+
     def fit(self) -> None:
         cfg = self.cfg
         for epoch in tqdm(range(cfg.epochs), desc="train"):
             self.model.train()
-            n_active = (
-                sigmoid_curriculum(epoch, cfg.epochs, cfg.max_agents)
-                if cfg.use_curriculum else cfg.max_agents
-            )
+            n_active = self.n_active(epoch)
             loader = DataLoader(
                 self.train_ds,
                 batch_size=cfg.batch_size,
                 shuffle=True,
                 num_workers=cfg.num_workers,
                 pin_memory=(self.device.type == "cuda"),
-                collate_fn=make_collate(cfg.max_agents, n_active),
+                collate_fn=make_collate(cfg.max_agents, n_active, cfg.shuffle_slots),
             )
-
-            running = {"total": 0.0, "denoising": 0.0, "boundary": 0.0,
-                       "temporal": 0.0, "velocity": 0.0, "collision": 0.0, "goal": 0.0}
+            running = {k: 0.0 for k in LOSS_KEYS}
             n_batches = 0
-            for frames, starts, goals, n_agents, trajs in loader:
-                frames = frames.to(self.device, non_blocking=True)
-                starts = starts.to(self.device, non_blocking=True)
-                goals = goals.to(self.device, non_blocking=True)
-                n_agents = n_agents.to(self.device, non_blocking=True)
-                trajs = trajs.to(self.device, non_blocking=True)
-
-                stats = self._train_batch(frames, starts, goals, n_agents, trajs)
+            for batch in loader:
+                batch = type(batch)(*(x.to(self.device, non_blocking=True) for x in batch))
+                stats = self._train_batch(batch)
                 for k in running:
                     running[k] += stats[k]
                 n_batches += 1
                 self.global_step += 1
 
             self.sched.step()
-            for k in running:
-                self.writer.add_scalar(f"loss/{k}", running[k] / max(n_batches, 1), epoch)
-            self.writer.add_scalar("curriculum/n_active", n_active, epoch)
-            self.writer.add_scalar("optim/lr", self.opt.param_groups[0]["lr"], epoch)
+            if self.writer is not None:
+                for k in running:
+                    self.writer.add_scalar(f"loss/{k}", running[k] / max(n_batches, 1), epoch)
+                self.writer.add_scalar("curriculum/n_active", n_active, epoch)
+                self.writer.add_scalar("optim/lr", self.opt.param_groups[0]["lr"], epoch)
 
             if (epoch + 1) % cfg.save_every == 0 or epoch == cfg.epochs - 1:
-                ckpt = Path(cfg.out_dir) / f"{cfg.run_name}_epoch_{epoch:05d}.pth"
-                torch.save({"model": self.model.state_dict(), "epoch": epoch, "cfg": cfg.__dict__}, ckpt)
+                self.save(epoch)
 
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train MA-DBP")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     args = parser.parse_args()
-    cfg = TrainConfig.from_yaml(args.config)
-    Trainer(cfg).fit()
+    Trainer(TrainConfig.from_yaml(args.config)).fit()
 
 
 if __name__ == "__main__":

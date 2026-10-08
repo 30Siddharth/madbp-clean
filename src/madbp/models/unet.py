@@ -117,7 +117,9 @@ class TrajectoryUNet(nn.Module):
 
     def forward(self, feat: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         B, Na, T, D = feat.shape
-        x = feat.view(B * Na, D, T)
+        # [B,Na,T,D] -> [B*Na, D, T]. A bare ``.view`` here (as in the original
+        # v2_2 code) would reinterpret memory and scramble the time/feature axes.
+        x = feat.permute(0, 1, 3, 2).reshape(B * Na, D, T)
         ctx_e = ctx.unsqueeze(1).expand(B, Na, -1).reshape(B * Na, -1)
 
         x = self.init_conv(x)
