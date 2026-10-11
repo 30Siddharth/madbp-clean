@@ -138,6 +138,30 @@ sub-goal), `--device cuda`. Scenario kinds: `open`, `obstacles`, `barrier`, `cor
 One CSV row per episode: success, goals reached, agent–agent and agent–obstacle collisions,
 makespan, path length, jerk, tracking error, planning time, minimum pair distance.
 
+#### Robots and videos
+`--robot point` (default) is a holonomic point mass, i.e. the VMAS dynamics the model was trained on.
+`--robot diffdrive` is a **non-holonomic differential-drive robot** (state x, y, θ; commands v, ω; first-order
+acceleration limits; wheel-speed limit `max|v ± ωb/2| ≤ 0.6 m/s`, track width `b = 0.08 m`; footprint radius 0.05 m)
+driven by a unicycle waypoint tracker (heading error steers, speed scaled by cos α, rotate in place when the
+waypoint is behind). The planner is unchanged, so the diff-drive runs show how well plans trained on holonomic data
+can be executed by a robot that cannot move sideways (see `tracking_error_mean` and the collision columns).
+In MuJoCo the diff-drive body is a planar (x, y, yaw) body with chassis, wheels and a heading marker; the
+non-holonomic constraint is enforced by commanding body velocity `(v cos θ, v sin θ, ω)` every sub-step, and
+MuJoCo resolves all contacts. It is not a wheel-ground friction model.
+
+```bash
+# top-down GIF/MP4 per episode (matplotlib; no OpenGL needed; works with every arena)
+python scripts/run_sim.py --planner madbp --checkpoint CKPT --arena mujoco --robot diffdrive \
+    --kinds barrier corridor --n-agents 6 --seeds 10 --dynamic \
+    --video-dir results/videos --n-videos 3 --video-format mp4
+
+# native MuJoCo renderer instead (needs OpenGL; fine on macOS)
+python scripts/run_sim.py ... --arena mujoco --video-backend mujoco --video-dir results/videos
+```
+Videos show robots (disc + heading tick), goals (stars in the robot's colour), the current planned window (dotted),
+fading trails, and a live collision counter. Use `--video-every 1` for smoother playback.
+Programmatic use: pass `recorder=Recorder(every=2)` to `run_episode` and call `save_video(rec, scenario, "ep.mp4")`.
+
 How an episode runs: every `H-1` waypoints (and immediately after a team change) the executor
 sets each agent's sub-goal (straight line to its goal, capped at the training window
 displacement), samples a window with MA-DBP, and tracks the waypoints with a PD controller in
@@ -190,8 +214,9 @@ src/madbp/
     trainer.py          # moving-window training loop + CLI
   sim/
     scenario.py         # layouts (open/obstacles/barrier/corridor) + add/remove Events
-    arena.py            # numpy point-mass arena (test double)
-    mujoco_arena.py     # MuJoCo physics, same interface
+    arena.py            # numpy point-mass + differential-drive arenas (test doubles)
+    mujoco_arena.py     # MuJoCo physics (point mass + diff-drive), same interface
+    record.py / video.py # episode recorder, GIF/MP4 rendering
     executor.py         # receding-horizon closed loop + metrics
     planners.py         # MADBPPlanner (checkpoint) + straight-line baseline
     vmas_layout.py      # layouts/frames from VMAS

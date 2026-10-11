@@ -46,3 +46,41 @@ def test_barrier_baseline_is_nontrivial():
         sc = make_scenario("barrier", 3, np.random.default_rng(s))
         wins += run_episode(PointMassArena(sc), StraightLinePlanner(8), ExecConfig(subgoal_cap=0.3), s).success
     assert wins < 5
+
+
+def test_diffdrive_is_nonholonomic_and_respects_wheel_limit():
+    from madbp.sim.arena import DiffDriveArena
+
+    sc = make_scenario("open", 2, np.random.default_rng(0))
+    sc.starts[:] = [[-0.5, 0.0], [0.5, 0.5]]
+    sc.goals[:] = [[0.5, 0.0], [-0.5, 0.5]]
+    a = DiffDriveArena(sc)
+    th0 = a.theta[0]
+    for _ in range(40):
+        a.step(np.tile([[5.0, 0.0]], (a.max_agents, 1)))  # absurd forward command
+        vl, vr = a.wheel_speeds()
+        assert max(np.abs(vl[a.active]).max(), np.abs(vr[a.active]).max()) <= a.wheel_max + 1e-9
+        # velocity always along the heading: no lateral slip
+        lat = a.vel[:, 0] * -np.sin(a.theta) + a.vel[:, 1] * np.cos(a.theta)
+        assert np.abs(lat[a.active]).max() < 1e-9
+    assert abs(a.theta[0] - th0) < 1e-6  # straight command -> no turning
+
+
+def test_diffdrive_closed_loop_open_scene():
+    from madbp.sim.arena import DiffDriveArena
+
+    sc = make_scenario("open", 3, np.random.default_rng(0))
+    r = run_episode(DiffDriveArena(sc), StraightLinePlanner(8), ExecConfig(subgoal_cap=0.3), 0)
+    assert r.success
+
+
+def test_video_roundtrip(tmp_path):
+    from madbp.sim.arena import DiffDriveArena
+    from madbp.sim.record import Recorder
+    from madbp.sim.video import save_video
+
+    sc = make_scenario("obstacles", 3, np.random.default_rng(1))
+    rec = Recorder(every=5)
+    run_episode(DiffDriveArena(sc), StraightLinePlanner(8), ExecConfig(subgoal_cap=0.3, max_steps=60), 0, recorder=rec)
+    out = save_video(rec, sc, str(tmp_path / "ep.gif"), fps=10)
+    assert (tmp_path / "ep.gif").stat().st_size > 1000 and out.endswith(".gif")

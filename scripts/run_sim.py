@@ -19,18 +19,22 @@ from pathlib import Path
 
 import numpy as np
 
-from madbp.sim.arena import PointMassArena
+from madbp.sim.arena import DiffDriveArena, PointMassArena
+from madbp.sim.record import Recorder
+from madbp.sim.video import save_pixels_video, save_video
 from madbp.sim.executor import ExecConfig, run_episode
 from madbp.sim.planners import MADBPPlanner, StraightLinePlanner
 from madbp.sim.scenario import Event, make_scenario
 
 
-def make_arena(kind: str, sc, max_agents: int):
+def make_arena(kind: str, sc, max_agents: int, robot: str = "point"):
     if kind == "mujoco":
-        from madbp.sim.mujoco_arena import MuJoCoArena
+        from madbp.sim.mujoco_arena import MuJoCoArena, MuJoCoDiffDriveArena
 
-        return MuJoCoArena(sc, max_agents=max_agents)
-    return PointMassArena(sc, max_agents=max_agents)
+        cls = MuJoCoDiffDriveArena if robot == "diffdrive" else MuJoCoArena
+        return cls(sc, max_agents=max_agents)
+    cls = DiffDriveArena if robot == "diffdrive" else PointMassArena
+    return cls(sc, max_agents=max_agents)
 
 
 def add_dynamic_events(sc, rng, max_agents):
@@ -58,6 +62,16 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=50, help="DDIM steps")
     p.add_argument("--init", default="gaussian", choices=["gaussian", "linear"])
     p.add_argument("--no-pinning-cap", action="store_true", help="use the final goal as sub-goal (no window cap)")
+    p.add_argument("--robot", choices=["point", "diffdrive"], default="point",
+                   help="point: holonomic point mass (matches the VMAS training dynamics); "
+                        "diffdrive: non-holonomic differential-drive robot + unicycle tracker")
+    p.add_argument("--video-dir", default=None, help="write episode videos here")
+    p.add_argument("--n-videos", type=int, default=3, help="videos per (kind, n_agents) cell")
+    p.add_argument("--video-format", choices=["gif", "mp4"], default="gif")
+    p.add_argument("--video-every", type=int, default=2, help="record every k-th control step")
+    p.add_argument("--video-fps", type=int, default=20)
+    p.add_argument("--video-backend", choices=["matplotlib", "mujoco"], default="matplotlib",
+                   help="matplotlib: top-down plot (no OpenGL); mujoco: native renderer (needs --arena mujoco + GL)")
     p.add_argument("--device", default="cpu")
     p.add_argument("--out", default="results/sim.csv")
     a = p.parse_args()
@@ -82,9 +96,28 @@ def main() -> None:
                     continue
                 if a.dynamic:
                     add_dynamic_events(sc, rng, a.max_agents)
-                r = run_episode(make_arena(a.arena, sc, a.max_agents), planner, cfg, seed)
+                arena = make_arena(a.arena, sc, a.max_agents, a.robot)
+                rec = None
+                if a.video_dir and seed < a.n_videos:
+                    mjr = None
+                    if a.video_backend == "mujoco":
+                        if a.arena != "mujoco":
+                            raise SystemExit("--video-backend mujoco requires --arena mujoco")
+                        mjr = arena.make_renderer()
+                    rec = Recorder(every=a.video_every, mj_renderer=mjr)
+                r = run_episode(arena, planner, cfg, seed, recorder=rec)
+                if rec is not None:
+                    Path(a.video_dir).mkdir(parents=True, exist_ok=True)
+                    stem = f"{a.planner}_{a.robot}_{a.arena}_{kind}_n{n}_s{seed}"
+                    vp = str(Path(a.video_dir) / f"{stem}.{a.video_format}")
+                    ttl = f"{a.planner}/{a.robot}/{kind}"
+                    if a.video_backend == "mujoco":
+                        save_pixels_video(rec.pixels, vp, a.video_fps)
+                    else:
+                        save_video(rec, sc, vp, a.video_fps, title=ttl)
+                    print("video:", vp)
                 row = r.as_row()
-                row.update(arena=a.arena, dynamic=a.dynamic, init=a.init)
+                row.update(arena=a.arena, robot=a.robot, dynamic=a.dynamic, init=a.init)
                 rows.append(row)
             sub = [r for r in rows if r["kind"] == kind and r["n_agents0"] == n]
             if sub:

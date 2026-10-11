@@ -38,3 +38,10 @@ the MuJoCo arena, VMAS layout extraction. The torch-free simulation core and exe
 ## Old checkpoints
 v2_2 diffusion checkpoints do not load into the paper-faithful model and were trained without the
 pre-processor in the loop; retrain. Datasets and MAPPO checkpoints are reusable.
+
+## Robot models in the simulation stack
+* `point`: holonomic point mass (matches training data dynamics).
+* `diffdrive`: non-holonomic unicycle with wheel-speed and acceleration limits plus a waypoint tracker. This is
+  the stronger feasibility claim: the same planner, trained on holonomic data, is executed by a robot with a turning
+  constraint. Report tracking error, collisions and (if any) failures separately from the point-mass results.
+* Neither is a hardware model: no wheel slip, motor dynamics, sensing or localisation noise.

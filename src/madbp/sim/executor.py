@@ -28,6 +28,8 @@ class ExecConfig:
     subgoal_cap: float | None = None  # world units; None -> no cap (use goal directly)
     kp: float = 12.0
     kv: float = 5.0
+    lin_gain: float = 6.0  # unicycle tracker: speed per metre of waypoint distance
+    ang_gain: float = 6.0  # unicycle tracker: rad/s per rad of heading error
     frame_size: int = 64
     stall_steps: int = 0  # 0 disables early stop
 
@@ -65,7 +67,7 @@ def _frame(arena, size):
                            arena.obs_r, arena.radius, arena.bound, size)
 
 
-def run_episode(arena, planner, cfg: ExecConfig, seed: int = 0, frame_fn=None) -> EpisodeResult:
+def run_episode(arena, planner, cfg: ExecConfig, seed: int = 0, frame_fn=None, recorder=None) -> EpisodeResult:
     sc = arena.sc
     events = sorted(sc.events, key=lambda e: e.step)
     ev_i, events_applied = 0, 0
@@ -123,9 +125,11 @@ def run_episode(arena, planner, cfg: ExecConfig, seed: int = 0, frame_fn=None) -
         k = min(wp_k, waypoints.shape[1] - 1)
         target = waypoints[:, k, :]
         err = target - arena.pos
-        acc = cfg.kp * err - cfg.kv * arena.vel
+        cmd = arena.track(target, *_gains(arena, cfg))
         prev = arena.pos.copy()
-        arena.step(acc)
+        arena.step(cmd)
+        if recorder is not None:
+            recorder.capture(arena, waypoints, wp_k)
         path_len += np.where(arena.active, np.linalg.norm(arena.pos - prev, axis=1), 0.0)
         track_err.append(float(np.linalg.norm(err[arena.active], axis=1).mean()) if arena.active.any() else 0.0)
         traj.append(arena.pos.copy())
@@ -162,6 +166,11 @@ def run_episode(arena, planner, cfg: ExecConfig, seed: int = 0, frame_fn=None) -
         min_pair_distance=float(min_pair),
         events_applied=events_applied,
     )
+
+
+def _gains(arena, cfg):
+    # point mass: PD gains (kp, kv); unicycle: (linear-speed gain, heading gain)
+    return (cfg.kp, cfg.kv) if arena.control == "accel" else (cfg.lin_gain, cfg.ang_gain)
 
 
 def _mean_jerk(traj, dt, mask):
